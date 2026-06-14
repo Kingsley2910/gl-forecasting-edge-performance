@@ -373,8 +373,8 @@ if __name__ == "__main__":
   # merge_strategy = args.merge_strategy
   # nodes = args.nodes
   # networks = args.networks
-  base_folder = "../experiments/8n-7k/seed4850"
-  merge_strategy = "SIMPLE_AVG"
+  base_folder = "../experiments/11n-8k/seed4850"
+  merge_strategy = "IMPROVED_OVERWRITE"
   nodes = "all"
   networks = [0]#"all"
   recompute_all = True

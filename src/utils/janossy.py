@@ -1,8 +1,10 @@
 from tensorflow.keras.utils import Sequence
+import tensorflow as tf
 
 from itertools import permutations
 import random
 import numpy as np
+import matplotlib.pyplot as plt
 
 
 class JanossyPermutedBatchSequence(Sequence): # non viene usato nel file di kan
@@ -100,3 +102,133 @@ def prepare_janossy_test_input(X, num_permutations=6): # nel file di kan è chia
       X_prepared[i, j] = X[i, list(perm)]
   return X_prepared
 
+class UncertaintyTrackingCallback(tf.keras.callbacks.Callback):
+  """
+  Tracks total and per-head losses (train + validation),
+  learned log_vars (uncertainty), and deltas (Huber thresholds)
+  during multitask training with uncertainty weighting.
+  """
+  def __init__(self, plot_interval=1, save_path=None):
+    super().__init__()
+    self.plot_interval = plot_interval
+    self.save_path = save_path
+    self.history = {
+      "loss": [],
+      "val_loss": [],
+      "per_head": {},        # training losses
+      "val_per_head": {},    # validation losses
+      "log_vars": {},
+      "deltas": {},
+      "loss_moving_averages": {}
+    }
+
+  def on_train_begin(self, logs=None):
+    # Set up dicts for each variable present in the model
+    if hasattr(self.model, "log_vars"):
+        for k in self.model.log_vars:
+            self.history["log_vars"][k] = []
+
+    if hasattr(self.model, "deltas"):
+        for k in self.model.deltas:
+            self.history["deltas"][k] = []
+    if hasattr(self.model, "loss_moving_averages"):
+        for k in self.model.loss_moving_averages:
+            self.history["loss_moving_averages"][k] = []
+
+  def on_epoch_end(self, epoch, logs=None):
+    logs = logs or {}
+    # Record total train/val losses
+    self.history["loss"].append(logs.get("loss"))
+    self.history["val_loss"].append(logs.get("val_loss"))
+    # --- Per-head losses (train) ---
+    for key, val in logs.items():
+      if key.endswith("_loss") and not key.startswith("val_"):
+        if key not in self.history["per_head"]:
+          self.history["per_head"][key] = []
+        self.history["per_head"][key].append(val)
+    # --- Per-head losses (validation) ---
+    for key, val in logs.items():
+      if key.startswith("val_") and key.endswith("_loss"):
+        clean_key = key.replace("val_", "")
+        if clean_key not in self.history["val_per_head"]:
+          self.history["val_per_head"][clean_key] = []
+        self.history["val_per_head"][clean_key].append(val)
+    # --- Record learned parameters ---
+    if hasattr(self.model, "log_vars"):
+        for k, v in self.model.log_vars.items():
+            self.history["log_vars"][k].append(v.numpy())
+
+    # if hasattr(self.model, "deltas"):
+    #   for k, v in self.model.deltas.items():
+    #     self.history["deltas"][k].append(v.numpy())
+    if hasattr(self.model, "loss_moving_averages"):
+        for k, v in self.model.loss_moving_averages.items():
+            self.history["loss_moving_averages"][k].append(v.numpy())
+    # --- Plot periodically ---
+    if (epoch + 1) % self.plot_interval == 0:
+        self._plot(epoch, save_all = False)
+
+  def _plot(self, epoch, save_all = True):
+    ncols = 4 if self.history["per_head"] else 3
+    plt.figure(figsize=(4 * ncols, 4))
+    # --- Total loss ---
+    plt.subplot(1, ncols, 1)
+    plt.plot(self.history["loss"], color='black', label="train")
+    if any(self.history["val_loss"]):
+      plt.plot(
+        self.history["val_loss"], color='red', linestyle='--', label="val"
+      )
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Total Loss")
+    plt.legend()
+    # --- Per-head losses (train + val) ---
+    if self.history["per_head"]:
+      plt.subplot(1, ncols, 2)
+      for k, vals in self.history["per_head"].items():
+        plt.plot(vals, label=f"{k} (train)")
+        if k in self.history["val_per_head"]:
+          plt.plot(
+            self.history["val_per_head"][k], linestyle='--', label=f"{k} (val)"
+          )
+      plt.xlabel("Epoch")
+      plt.ylabel("Loss")
+      plt.title("Per-head Losses")
+      plt.legend(fontsize=8)
+    # --- log_vars (uncertainty weights) ---
+    if self.history["log_vars"]:
+      plt.subplot(1, ncols, ncols - 1)
+      for k, vals in self.history["log_vars"].items():
+        plt.plot(vals, '.-', label=k)
+      plt.xlabel("Epoch")
+      plt.ylabel("log(σ²)")
+      plt.title("Task Uncertainty (log_vars)")
+      plt.legend(fontsize=8)
+    # # --- deltas (Huber thresholds) ---
+    # if self.history["deltas"]:
+    #   plt.subplot(1, ncols, ncols)
+    #   for k, vals in self.history["deltas"].items():
+    #     plt.plot(vals, label=k)
+    #   plt.xlabel("Epoch")
+    #   plt.ylabel("δ (Huber threshold)")
+    #   plt.title("Adaptive Robustness (δ per head)")
+    #   plt.legend(fontsize=8)
+    # --- deltas (Huber thresholds) ---
+    if self.history["loss_moving_averages"]:
+      plt.subplot(1, ncols, ncols)
+      for k, vals in self.history["loss_moving_averages"].items():
+        plt.plot(vals, label=k)
+      plt.xlabel("Epoch")
+      plt.ylabel("loss_moving_averages")
+      plt.title("loss_moving_averages")
+      plt.legend(fontsize=8)
+    plt.tight_layout()
+    if self.save_path:
+      fname = (
+        f"training_curves_epoch_{epoch+1}" if save_all 
+          else "training_curves_epoch"
+      )
+      plt.savefig(
+        f"{self.save_path}/{fname}.png", dpi=150
+      )
+    plt.close()

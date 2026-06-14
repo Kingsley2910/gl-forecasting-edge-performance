@@ -23,7 +23,7 @@ from gossiplearning.models import (
 )
 from gossiplearning.weights_marshaling import MarshalWeightsFn
 from utils.metrics import compute_metrics, Metrics
-from utils.janossy import prepare_janossy_input, prepare_janossy_test_input
+from utils.janossy import prepare_janossy_input, prepare_janossy_test_input, UncertaintyTrackingCallback
 
 
 class NodeState(IntEnum):
@@ -95,6 +95,13 @@ class Node:
         self.eval_metrics: list[Metrics] = []
         self.weight = weight_fn(self.data)
 
+        self._tracker_dir = self._workspace_dir / "plots" / "uncertainty" / f"node_{self.id}"
+        self._tracker_dir.mkdir(parents=True, exist_ok=True)
+
+        self._tracker = UncertaintyTrackingCallback(
+            plot_interval=1,
+            save_path=str(self._tracker_dir))
+
     def merge_models(self) -> None:
         """
         Merge all the received model weights into the current model.
@@ -164,6 +171,7 @@ class Node:
 
         best_val_loss = math.inf
         best_weights = None
+        
         for i in range(n_epochs):
             history = model.fit(
                 X_prepared,
@@ -174,6 +182,7 @@ class Node:
                 batch_size=self._training_config.batch_size,
                 validation_batch_size=self._training_config.batch_size,
                 shuffle=self._training_config.shuffle_batch,
+                callbacks=[self._tracker],
             ).history
 
             if len(model.loss) > 1:

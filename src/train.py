@@ -1,7 +1,7 @@
 from utils.model_creators import build_janossy_rnn_model
 from gossiplearning.config import Config
 
-from utils.janossy import prepare_janossy_input, prepare_janossy_test_input
+from utils.janossy import prepare_janossy_input, prepare_janossy_test_input, UncertaintyTrackingCallback
 from utils.data import load_dataset, load_tasks
 
 from statsmodels.graphics.mosaicplot import mosaic
@@ -574,6 +574,13 @@ def train_one_model(
     monitor = "val_loss",
     mode = "min",
   )
+
+  basedir, fname = os.path.split(checkpoint_path)
+  log_dir = os.path.join(
+      basedir, "logs", str(fname.replace(".keras", "").split("_")[0])
+  )
+  os.makedirs(log_dir, exist_ok=True)
+
   # extract data
   train_data, validation_data, _ = dataset
   X_train = train_data[0]
@@ -587,6 +594,13 @@ def train_one_model(
   X_val_prepared, Y_val_prepared = prepare_janossy_input(
     X_val, Y_val, num_permutations = 6
   )
+  
+  # callbacks
+  tracker = UncertaintyTrackingCallback(
+      plot_interval=5,
+      save_path=log_dir
+  )
+
   # train
   history = model.fit(
     X_train_prepared,
@@ -599,6 +613,7 @@ def train_one_model(
     callbacks = [
       # early_stopping,
       model_checkpoint,
+      tracker
     ],
     epochs = config.training.epochs_per_update * config.training.fixed_updates,
     batch_size = config.training.batch_size,
