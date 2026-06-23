@@ -286,20 +286,13 @@ class Node:
             self._best_weights = weights
 
     def persist_best_model(self) -> None:
-        """
-        Serialize and persist the best model achieved so far.
-        """
-        best_model = self._create_model()
-        best_model.set_weights(self._best_weights)
-
-        best_model.save(
+        self._model.save(
             str(
                 self._workspace_dir
                 / self._training_config.models_folder
                 / f"{self.id}.keras"
             )
         )
-
     def receive_weights(self, received: WeightsMessage, from_node: NodeId) -> None:
         """
         Receive marshaled weights from a node and store them in the internal buffer.
