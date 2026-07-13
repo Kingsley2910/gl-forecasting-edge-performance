@@ -1,4 +1,5 @@
 import math
+import numpy as np
 from enum import IntEnum
 from pathlib import Path
 from typing import Optional
@@ -7,6 +8,7 @@ from gossiplearning.config import TrainingConfig, HistoryConfig
 from gossiplearning.log import Logger
 from gossiplearning.models import (
     StopCriterion,
+    MergeStrategy,
     ModelWeights,
     Loss,
     NodeId,
@@ -21,7 +23,10 @@ from gossiplearning.models import (
     LabelledData,
     NodeWeightFn,
 )
-from gossiplearning.weights_marshaling import MarshalWeightsFn
+from gossiplearning.weights_marshaling import (
+    MarshalWeightsFn,
+    unflatten_weights,
+)
 from utils.metrics import compute_metrics, Metrics
 from utils.janossy import prepare_janossy_input, prepare_janossy_test_input, UncertaintyTrackingCallback
 
@@ -73,6 +78,8 @@ class Node:
         self._workspace_dir = workspace_dir
 
         self.data: Dataset = node_data_fn(id)
+        self.node_type = self._extract_node_type(self.data["X_train"])
+        self._synthetic_data_by_node_type: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
         self._last_improved_time = 0
         self._updates_without_improving = 0
@@ -101,6 +108,185 @@ class Node:
         self._tracker = UncertaintyTrackingCallback(
             plot_interval=1,
             save_path=str(self._tracker_dir))
+        
+    def _extract_node_type(self, X: np.ndarray) -> int:
+        """
+        Extract the node type from the node's local training data.
+
+        Each valid sequence step has the structure:
+        [rate, function one-hot encoding, node_type].
+
+        Padding steps contain only zeros.
+        """
+        if X.ndim != 3:
+            raise ValueError(
+                f"Expected X_train with 3 dimensions, received shape {X.shape}"
+            )
+
+        # A valid step has at least one non-zero value before node_type.
+        # Padding steps are entirely zero.
+        valid_steps = np.any(X[:, :, :-1] != 0, axis=2)
+
+        node_types = X[:, :, -1][valid_steps]
+
+        if len(node_types) == 0:
+            raise ValueError(
+                f"Cannot determine node_type for node {self.id}: "
+                "no valid steps found in X_train."
+            )
+
+        unique_node_types = np.unique(node_types)
+
+        if len(unique_node_types) != 1:
+            raise ValueError(
+                f"Node {self.id} contains multiple node types: "
+                f"{unique_node_types.tolist()}"
+            )
+
+        return int(unique_node_types[0])
+    
+    def _replace_node_type(
+        self,
+        X: np.ndarray,
+        new_node_type: int,
+    ) -> np.ndarray:
+        """
+        Create a copy of X and replace node_type in every real sequence step.
+
+        Padding steps remain filled with zeros.
+        """
+        if new_node_type not in (0, 1, 2):
+            raise ValueError(
+                f"Invalid node_type {new_node_type}. Expected 0, 1 or 2."
+            )
+
+        X_modified = X.copy()
+
+        # True for actual function steps, False for padding.
+        valid_steps = np.any(X_modified[:, :, :-1] != 0, axis=2)
+
+        # Replace node_type only in real steps.
+        X_modified[:, :, -1] = np.where(
+            valid_steps,
+            new_node_type,
+            0,
+        )
+
+        return X_modified
+    
+    def _build_received_model(
+        self,
+        message: WeightsMessage,
+    ):
+        """
+        Create a temporary model containing the weights received from another node.
+
+        The local model is not modified.
+        """
+        received_model = self._create_model()
+
+        received_weights = unflatten_weights(
+            received_model,
+            message.marshaled_weights.weights,
+        )
+
+        received_model.set_weights(received_weights)
+
+        return received_model
+    
+    def _generate_synthetic_data(
+        self,
+        message: WeightsMessage,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Generate synthetic training data using the received model.
+
+        The local workloads are preserved, while node_type is replaced
+        with the node_type of the sender.
+        """
+        received_node_type = message.sender_node_type
+
+        if received_node_type not in (0, 1, 2):
+            raise ValueError(
+                f"Invalid sender node_type: {received_node_type}"
+            )
+
+        # Same local workloads, but with the sender's node_type.
+        X_synthetic = self._replace_node_type(
+            self.data["X_train"],
+            new_node_type=received_node_type,
+        )
+
+        # Reconstruct the received model.
+        received_model = self._build_received_model(message)
+
+        # Prepare input for Janossy pooling.
+        X_prepared = prepare_janossy_test_input(
+            X_synthetic,
+            num_permutations=6,
+        )
+
+        # The received model predicts:
+        # - 3 regression targets
+        # - overloaded_node probability
+        predictions = received_model.predict(
+            X_prepared,
+            verbose=0,
+        )
+
+        regression_predictions = np.asarray(predictions[0])
+
+        # Same classification rule used in centralized evaluation:
+        # probability < 0.5 -> 0
+        # probability >= 0.5 -> 1
+        classification_predictions = np.array(
+            [
+                0 if float(np.asarray(p).squeeze()) < 0.5 else 1
+                for p in predictions[1]
+            ],
+            dtype=int,
+        ).reshape(-1, 1)
+
+        if regression_predictions.ndim != 2:
+            raise RuntimeError(
+                "Regression predictions must be a 2-dimensional array. "
+                f"Received shape: {regression_predictions.shape}"
+            )
+
+        if regression_predictions.shape[1] != 3:
+            raise RuntimeError(
+                "Expected 3 regression targets "
+                "(cpu_usage_node, ram_usage_node, "
+                "ram_usage_node_percentage), "
+                f"received {regression_predictions.shape[1]}."
+            )
+
+        # Y order:
+        # 0 -> cpu_usage_node
+        # 1 -> ram_usage_node
+        # 2 -> ram_usage_node_percentage
+        # 3 -> overloaded_node
+        Y_synthetic = np.concatenate(
+            [
+                regression_predictions,
+                classification_predictions,
+            ],
+            axis=1,
+        )
+
+        if len(X_synthetic) != len(Y_synthetic):
+            raise RuntimeError(
+                "Synthetic X and Y have different numbers of samples: "
+                f"{len(X_synthetic)} != {len(Y_synthetic)}"
+            )
+
+        if Y_synthetic.shape[1] != 4:
+            raise RuntimeError(
+                "Synthetic Y must contain 4 columns, "
+                f"received shape {Y_synthetic.shape}."
+            )
+
+        return X_synthetic, Y_synthetic
 
     def merge_models(self) -> None:
         """
@@ -108,7 +294,45 @@ class Node:
 
         The internal model weights are updated. The number of trained samples is set at the
         maximum between the number of trained samples of the merged models.
+
+        With NODE_TYPE_MERGE, each received model is first used to generate
+        synthetic data representing its node type. Synthetic data for the
+        same node type replace the previously stored block.
         """
+
+        messages = tuple(self._received_weights.values())
+
+        if self._training_config.merge_strategy == MergeStrategy.NODE_TYPE_MERGE:
+            for message in messages:
+                received_node_type = message.sender_node_type
+
+                # Do not generate synthetic data for the local node type,
+                # because real local data are already available.
+                if received_node_type == self.node_type:
+                    continue
+
+                X_synthetic, Y_synthetic = self._generate_synthetic_data(
+                    message
+                )
+
+                # The dictionary key is the received node type.
+                # A new block automatically replaces the old block
+                # belonging to the same node type.
+                self._synthetic_data_by_node_type[received_node_type] = (
+                    X_synthetic,
+                    Y_synthetic,
+                )
+
+                #BLOCCO TEMPORANEO PER TESTARE
+                print(
+                    f"[NODE_TYPE_MERGE] Node {self.id} "
+                    f"(type={self.node_type}) received type={received_node_type}; "
+                    f"synthetic X={X_synthetic.shape}, "
+                    f"synthetic Y={Y_synthetic.shape}; "
+                    f"stored types={list(self._synthetic_data_by_node_type.keys())}"
+                )
+                # -----------------------------
+
         self._model, self.accumulated_weight = self._aggregator(
             self._model,
             self.accumulated_weight,
@@ -116,6 +340,7 @@ class Node:
         )
 
         self._received_weights = {}
+
 
     def perform_update(self) -> tuple[ModelWeights, ModelWeights, Loss, int]:
         """
@@ -162,8 +387,41 @@ class Node:
         model = self._create_model()
         model.set_weights(self._model.get_weights())
 
+        X_train = self.data["X_train"]
+        Y_train = self.data["Y_train"]
+        if self._synthetic_data_by_node_type:
+
+            synthetic_x = [
+                data[0]
+                for data in self._synthetic_data_by_node_type.values()
+            ]
+
+            synthetic_y = [
+                data[1]
+                for data in self._synthetic_data_by_node_type.values()
+            ]
+
+            X_train = np.concatenate(
+                [X_train] + synthetic_x,
+                axis=0,
+            )
+
+            Y_train = np.concatenate(
+                [Y_train] + synthetic_y,
+                axis=0,
+            )
+
+        # BLOCCO TEMPORANEO PER TESTARE
+        print(
+            f"[NODE_TYPE_MERGE] Node {self.id} training with "
+            f"X={X_train.shape}, Y={Y_train.shape}, "
+            f"real_samples={len(self.data['X_train'])}, "
+            f"synthetic_types={list(self._synthetic_data_by_node_type.keys())}"
+        )
+        # -----------------------------
+
         X_prepared, Y_prepared = prepare_janossy_input(
-            self.data["X_train"], self.data["Y_train"], num_permutations = 6
+            X_train, Y_train, num_permutations = 6
         )
         X_val_prepared, Y_val_prepared = prepare_janossy_input(
             self.data["X_val"], self.data["Y_val"], num_permutations = 6
@@ -220,6 +478,7 @@ class Node:
             optimizer_state=self._model.optimizer.variables()
             if self._training_config.serialize_optimizer
             else None,
+            sender_node_type=self.node_type,
         )
 
     def save_model(

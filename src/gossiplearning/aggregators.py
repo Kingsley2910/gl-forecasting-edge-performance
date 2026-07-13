@@ -199,6 +199,31 @@ def merge_with_custom_strategy(fn: AggregatorFn) -> AggregatorFn:
 
     return wrapped_fn
 
+def merge_weights_with_node_type_merge(
+    current_model: keras.Model,
+    node_model_age: int,
+    weights_messages: tuple[WeightsMessage, ...],
+) -> tuple[keras.Model, int]:
+    if len(weights_messages) != 1:
+        raise RuntimeError(
+            "NODE_TYPE_MERGE works with one received model at a time."
+        )
+
+    message = weights_messages[0]
+
+    received_weights = unflatten_weights(
+        current_model,
+        message.marshaled_weights.weights,
+    )
+
+    current_model.set_weights(received_weights)
+
+    if message.optimizer_state:
+        current_model.optimizer.build(current_model.variables)
+        current_model.optimizer.set_weights(message.optimizer_state)
+
+    return current_model, message.model_weight
+
 
 def choose_aggregator(
     strategy: MergeStrategy = MergeStrategy.SIMPLE_AVG,
@@ -212,6 +237,7 @@ def choose_aggregator(
         MergeStrategy.AGE_WEIGHTED: merge_weights_with_age_weighted_avg,
         MergeStrategy.OVERWRITE: merge_weights_with_overwrite,
         MergeStrategy.IMPROVED_OVERWRITE: merge_with_intelligent_overwrite,
+        MergeStrategy.NODE_TYPE_MERGE: merge_weights_with_node_type_merge,
     }
 
     if strategy not in handlers:

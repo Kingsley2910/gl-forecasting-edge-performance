@@ -388,12 +388,24 @@ def convert_node_type(node_type: str) -> int:
 
 def assign_node_type(
     towers: pd.DataFrame, node_types: list, rng: np.random.Generator
-  ) -> pd.DataFrame:
-  nt = [
-    convert_node_type(rng.choice(node_types)) for _ in range(len(towers))
-  ]
-  towers["node_type"] = nt
-  return towers
+) -> pd.DataFrame:
+
+    n_nodes = len(towers)
+    n_types = len(node_types)
+
+    base_count = n_nodes // n_types
+    remainder = n_nodes % n_types
+
+    assigned_types = []
+    for node_type in node_types:
+        assigned_types.extend([convert_node_type(node_type)] * base_count)
+    if remainder > 0:
+        extra_types = rng.choice(node_types, size=remainder, replace=False)
+        for node_type in extra_types:
+            assigned_types.append(convert_node_type(node_type))
+    rng.shuffle(assigned_types)
+    towers["node_type"] = assigned_types
+    return towers
 
 def assign_functions( # attualmente sembra non essere utilizzato i
     towers: pd.DataFrame, 

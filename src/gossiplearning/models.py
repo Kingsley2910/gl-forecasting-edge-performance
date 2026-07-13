@@ -53,6 +53,7 @@ class WeightsMessage:
     marshaled_weights: MarshaledWeights
     model_weight: int
     optimizer_state: list[tf.Variable] | None
+    sender_node_type: int
 
 
 AggregatorFn = Callable[
@@ -79,6 +80,7 @@ class MergeStrategy(str, Enum):
     AGE_WEIGHTED = "age_weighted"
     OVERWRITE = "overwrite"
     IMPROVED_OVERWRITE = "improved_overwrite"
+    NODE_TYPE_MERGE = "node_type_merge"
 
 
 class StopCriterion(str, Enum):
