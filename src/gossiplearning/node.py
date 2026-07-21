@@ -4,6 +4,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Optional
 
+from gossiplearning.aggregators import choose_aggregator
 from gossiplearning.config import TrainingConfig, HistoryConfig
 from gossiplearning.log import Logger
 from gossiplearning.models import (
@@ -287,6 +288,42 @@ class Node:
             )
 
         return X_synthetic, Y_synthetic
+    
+    def _get_current_merge_strategy(self) -> MergeStrategy:
+        """
+        Return the merge strategy to use for the current update.
+
+        The first `node_type_merge_updates` updates use NODE_TYPE_MERGE.
+        Subsequent updates use `subsequent_merge_strategy`.
+        """
+
+        n_node_type_updates = self._training_config.node_type_merge_updates
+        subsequent_strategy = self._training_config.subsequent_merge_strategy
+
+        # Modalità normale: nessun cambio di strategia configurato.
+        if n_node_type_updates == 0 or subsequent_strategy is None:
+            return self._training_config.merge_strategy
+
+        # _completed_updates starts from 0.
+        if self._completed_updates < n_node_type_updates:
+            return MergeStrategy.NODE_TYPE_MERGE
+
+        return subsequent_strategy
+    
+    def _get_current_num_merged_models(self) -> int:
+        if (
+            self._training_config.node_type_merge_updates == 0
+            or self._training_config.subsequent_num_merged_models is None
+        ):
+            return self._training_config.num_merged_models
+
+        if (
+            self._completed_updates
+            < self._training_config.node_type_merge_updates
+        ):
+            return self._training_config.num_merged_models
+
+        return self._training_config.subsequent_num_merged_models
 
     def merge_models(self) -> None:
         """
@@ -302,7 +339,9 @@ class Node:
 
         messages = tuple(self._received_weights.values())
 
-        if self._training_config.merge_strategy == MergeStrategy.NODE_TYPE_MERGE:
+        current_strategy = self._get_current_merge_strategy()
+
+        if current_strategy == MergeStrategy.NODE_TYPE_MERGE:
             for message in messages:
                 received_node_type = message.sender_node_type
 
@@ -323,7 +362,7 @@ class Node:
                     Y_synthetic,
                 )
 
-                #BLOCCO TEMPORANEO PER TESTARE
+                # BLOCCO TEMPORANEO PER TESTARE
                 print(
                     f"[NODE_TYPE_MERGE] Node {self.id} "
                     f"(type={self.node_type}) received type={received_node_type}; "
@@ -333,11 +372,21 @@ class Node:
                 )
                 # -----------------------------
 
-        self._model, self.accumulated_weight = self._aggregator(
+        current_aggregator = choose_aggregator(current_strategy)
+
+        self._model, self.accumulated_weight = current_aggregator(
             self._model,
             self.accumulated_weight,
-            tuple(msg for k, msg in self._received_weights.items()),
+            messages,
         )
+
+        # BLOCCO TEMPORANEO PER TESTARE
+        print(
+            f"[DYNAMIC_MERGE] Node {self.id} "
+            f"update={self._completed_updates + 1} "
+            f"strategy={current_strategy.value}"
+        )
+        # -----------------------------
 
         self._received_weights = {}
 
@@ -575,11 +624,15 @@ class Node:
             self.eval_metrics.append(metrics)
 
     @property
+    
     def ready_to_train(self) -> bool:
         """
         Whether then node has buffered a minimum number of models to perform an update.
         """
-        return len(self._received_weights) >= self._training_config.num_merged_models
+        return (
+            len(self._received_weights)
+            >= self._get_current_num_merged_models()
+        )
 
     def _check_stop_criterion(self):
         """

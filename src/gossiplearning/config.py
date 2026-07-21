@@ -99,6 +99,22 @@ class TrainingConfig(BaseModel):
     merge_strategy: MergeStrategy = Field(
         MergeStrategy.SIMPLE_AVG, description="The strategy used to merge model weights"
     )
+    node_type_merge_updates: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Number of initial updates performed with NODE_TYPE_MERGE "
+            "before switching to another merge strategy"
+        ),
+    )
+
+    subsequent_merge_strategy: MergeStrategy | None = Field(
+        None,
+        description=(
+            "Merge strategy used after the initial NODE_TYPE_MERGE updates"
+        ),
+    )
+
     batch_size: int = Field(..., description="The batch size to be used for training")
     epochs_per_update: int = Field(
         ...,
@@ -118,6 +134,14 @@ class TrainingConfig(BaseModel):
     num_merged_models: int = Field(
         1, description="The number of model weights to merge each time"
     )
+    subsequent_num_merged_models: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Number of models to merge after switching to "
+            "subsequent_merge_strategy"
+        ),
+    )
     shuffle_batch: bool = Field(
         True, description="Whether to shuffle batch data during training"
     )
@@ -136,6 +160,41 @@ class TrainingConfig(BaseModel):
     ge=1,
     description="Number of permutations for Janossy pooling"
     )      
+
+    @model_validator(mode="after")
+    def validate_dynamic_merge_strategy(self) -> "TrainingConfig":
+        if self.node_type_merge_updates > 0:
+
+            if self.subsequent_num_merged_models is None:
+                raise ValueError(
+                    "subsequent_num_merged_models must be specified when "
+                    "node_type_merge_updates is greater than 0."
+                )
+
+            if self.merge_strategy != MergeStrategy.NODE_TYPE_MERGE:
+                raise ValueError(
+                    "When node_type_merge_updates is greater than 0, "
+                    "merge_strategy must be 'node_type_merge'."
+                )
+
+            if self.subsequent_merge_strategy is None:
+                raise ValueError(
+                    "subsequent_merge_strategy must be specified when "
+                    "node_type_merge_updates is greater than 0."
+                )
+
+            if self.subsequent_merge_strategy == MergeStrategy.NODE_TYPE_MERGE:
+                raise ValueError(
+                    "subsequent_merge_strategy must be different from "
+                    "'node_type_merge'."
+                )
+
+            if self.node_type_merge_updates >= self.fixed_updates:
+                raise ValueError(
+                    "node_type_merge_updates must be smaller than fixed_updates."
+                )
+
+        return self
 
 
 class DataPreparationConfig(BaseModel):
@@ -197,7 +256,7 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def validate_config(self) -> "Config":
-        # only validate length of nodes if provided
+        # Only validate length of nodes if provided.
         if len(self.nodes) > 0 and self.n_nodes != len(self.nodes):
             raise ValueError("Inconsistent number of nodes")
 
@@ -207,25 +266,56 @@ class Config(BaseModel):
             for node in self.nodes
         ):
             raise ValueError(
-                "Node IDs should be numbers between 0 and N-1, where N is the number of nodes"
+                "Node IDs should be numbers between 0 and N-1, "
+                "where N is the number of nodes"
+            )
+
+        # Maximum number of models that a node may need to receive,
+        # considering both the initial and subsequent phases.
+        max_num_merged_models = self.training.num_merged_models
+
+        if self.training.subsequent_num_merged_models is not None:
+            max_num_merged_models = max(
+                max_num_merged_models,
+                self.training.subsequent_num_merged_models,
             )
 
         if any(
-            len(node_conf.links) < self.training.num_merged_models
+            len(node_conf.links) < max_num_merged_models
             for node_conf in self.nodes
         ):
             raise Exception(
-                f"There are nodes with less than {self.training.num_merged_models} neighbors!"
+                f"There are nodes with less than "
+                f"{max_num_merged_models} neighbors!"
             )
 
-        if (
-            self.training.num_merged_models > 1
-            and self.training.merge_strategy == MergeStrategy.OVERWRITE
-        ):
-            raise Exception("Overwrite merge strategy only works with 1 merged model")
-
+        # OVERWRITE in the initial phase can merge only one model.
         if (
             self.training.merge_strategy == MergeStrategy.OVERWRITE
+            and self.training.num_merged_models > 1
+        ):
+            raise Exception(
+                "Overwrite merge strategy only works with 1 merged model"
+            )
+
+        # OVERWRITE in the subsequent phase can merge only one model.
+        if (
+            self.training.subsequent_merge_strategy
+            == MergeStrategy.OVERWRITE
+            and self.training.subsequent_num_merged_models != 1
+        ):
+            raise Exception(
+                "Subsequent overwrite merge strategy only works "
+                "with 1 merged model"
+            )
+
+        configured_strategies = {
+            self.training.merge_strategy,
+            self.training.subsequent_merge_strategy,
+        }
+
+        if (
+            MergeStrategy.OVERWRITE in configured_strategies
             and self.training.perc_sent_weights < 1
         ):
             raise Exception(
