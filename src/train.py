@@ -151,7 +151,11 @@ def compute_and_plot_predictions(
       ax[j].legend(loc = "upper left", fontsize = fontsize)
       ax[j].grid(True)
     # compute confusion matrix classification results
-    cmatrix = metrics.confusion_matrix(Y_data_cls, Y_pred_cls)
+    cmatrix = metrics.confusion_matrix(
+        Y_data_cls,
+        Y_pred_cls,
+        labels=[0, 1],
+    )
     cmatrices[data_key] = cmatrix
     idx += 1
   # save figure
@@ -180,14 +184,31 @@ def compute_and_plot_predictions(
     )
     cm_display.plot(ax = ax[0], text_kw = {"fontsize": fontsize})
     #
-    nclass_classification_mosaic_plot(
-      cmatrix.shape[0], 
-      cmatrix,
-      ax = ax[1]
-      # None if output_folder is None else os.path.join(
-      #   output_folder, f"mosaic_plot_{node}_{data_key}.png"
-      # )
-    )
+    # The mosaic plot cannot represent classes having an entire
+    # zero row or zero column in the confusion matrix.
+    has_empty_row = np.any(cmatrix.sum(axis=1) == 0)
+    has_empty_column = np.any(cmatrix.sum(axis=0) == 0)
+
+    if not has_empty_row and not has_empty_column:
+      nclass_classification_mosaic_plot(
+        cmatrix.shape[0],
+        cmatrix,
+        ax=ax[1],
+      )
+    else:
+      ax[1].axis("off")
+      ax[1].text(
+        0.5,
+        0.5,
+        (
+          "Mosaic plot unavailable\n"
+          "because at least one class is absent"
+        ),
+        horizontalalignment="center",
+        verticalalignment="center",
+        fontsize=fontsize,
+        transform=ax[1].transAxes,
+      )
     idx += 1
   plt.savefig(
     os.path.join(

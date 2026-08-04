@@ -137,6 +137,213 @@ def load_gossip_models_and_data(
         }
   return models, all_X_Y_data, plot_folders
 
+def compute_common_test_predictions_by_node_type(
+    models: dict,
+    all_X_Y_data: dict,
+    plot_folders: dict,
+    tasks: dict,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Evaluate every gossip model on the common test set,
+    splitting common-test samples by node_type.
+    """
+
+    all_predictions = pd.DataFrame()
+
+    all_metrics = {
+        "key": [],
+        "node": [],
+        "common_test_node_type": [],
+        "seed": [],
+        "metrics": [],
+    }
+
+    for node, sim_models in models.items():
+        for seed, model in sim_models.items():
+
+            X_common, Y_common = (
+                all_X_Y_data[node][seed]["common_test"]
+            )
+
+            X_common = np.asarray(X_common)
+            Y_common = np.asarray(Y_common)
+
+            if X_common.ndim != 3:
+                raise RuntimeError(
+                    "Common-test X must have 3 dimensions. "
+                    f"Received shape: {X_common.shape}"
+                )
+
+            if len(X_common) != len(Y_common):
+                raise RuntimeError(
+                    "Common-test X and Y have different sample counts: "
+                    f"{len(X_common)} != {len(Y_common)}"
+                )
+
+            # True for actual timesteps, False for zero-padding.
+            valid_steps = np.any(
+                X_common[:, :, :-1] != 0,
+                axis=2,
+            )
+
+            sample_node_types = np.full(
+                len(X_common),
+                -1,
+                dtype=int,
+            )
+
+            for sample_index in range(len(X_common)):
+                node_types_in_sample = X_common[
+                    sample_index,
+                    :,
+                    -1,
+                ][valid_steps[sample_index]]
+
+                if len(node_types_in_sample) == 0:
+                    raise RuntimeError(
+                        "Cannot determine node_type for common-test "
+                        f"sample {sample_index}: no valid timestep."
+                    )
+
+                unique_node_types = np.unique(
+                    node_types_in_sample
+                )
+
+                if len(unique_node_types) != 1:
+                    raise RuntimeError(
+                        "A common-test sample contains multiple "
+                        f"node types: sample={sample_index}, "
+                        f"types={unique_node_types.tolist()}"
+                    )
+
+                sample_node_types[sample_index] = int(
+                    unique_node_types[0]
+                )
+
+            node_plot_folder = os.path.join(
+                plot_folders[seed],
+                "common_test_by_node_type",
+                f"node_{node}",
+            )
+
+            os.makedirs(
+                node_plot_folder,
+                exist_ok=True,
+            )
+
+            for common_test_node_type in (0, 1, 2):
+
+                type_mask = (
+                    sample_node_types
+                    == common_test_node_type
+                )
+
+                n_samples = int(type_mask.sum())
+
+                if n_samples == 0:
+                    print(
+                        f"[COMMON_TEST_BY_TYPE] "
+                        f"model_node={node}, seed={seed}, "
+                        f"type={common_test_node_type}: "
+                        "no samples"
+                    )
+                    continue
+
+                X_type = X_common[type_mask]
+                Y_type = Y_common[type_mask]
+
+                dataset_key = (
+                    f"common_test_node_type_"
+                    f"{common_test_node_type}"
+                )
+
+                predictions = compute_and_plot_predictions(
+                    {
+                        dataset_key: (
+                            X_type,
+                            Y_type,
+                        )
+                    },
+                    model,
+                    node_plot_folder,
+                    (
+                        f"node_{node}_"
+                        f"common_test_type_"
+                        f"{common_test_node_type}"
+                    ),
+                    tasks[
+                        "Multi_Task_regression"
+                    ]["targets"],
+                )
+
+                pred = predictions[dataset_key]
+
+                prediction_df = get_predictions_df(
+                    Y_type,
+                    pred,
+                    tasks,
+                )
+
+                prediction_df["key"] = dataset_key
+                prediction_df["node"] = node
+                prediction_df[
+                    "common_test_node_type"
+                ] = common_test_node_type
+                prediction_df["seed"] = seed
+
+                all_predictions = pd.concat(
+                    [
+                        all_predictions,
+                        prediction_df,
+                    ],
+                    ignore_index=True,
+                )
+
+                calculated_metrics = compute_metrics(
+                    Y_type,
+                    pred,
+                )
+
+                all_metrics["key"].append(dataset_key)
+                all_metrics["node"].append(node)
+                all_metrics[
+                    "common_test_node_type"
+                ].append(common_test_node_type)
+                all_metrics["seed"].append(seed)
+                all_metrics["metrics"].append(
+                    calculated_metrics
+                )
+
+                class_values, class_counts = np.unique(
+                    Y_type[:, -1].astype(int),
+                    return_counts=True,
+                )
+
+                class_distribution = dict(
+                    zip(
+                        class_values.tolist(),
+                        class_counts.tolist(),
+                    )
+                )
+
+                print(
+                    f"[COMMON_TEST_BY_TYPE] "
+                    f"model_node={node}, "
+                    f"seed={seed}, "
+                    f"type={common_test_node_type}, "
+                    f"samples={n_samples}, "
+                    f"class_distribution="
+                    f"{class_distribution}"
+                )
+
+    if len(all_metrics["metrics"]) == 0:
+        return all_predictions, pd.DataFrame()
+
+    return (
+        all_predictions,
+        get_metrics_df(all_metrics),
+    )
+
 
 def get_metrics_df(metrics_data: pd.DataFrame) -> pd.DataFrame:
   all_metrics = pd.DataFrame(metrics_data)
@@ -373,7 +580,7 @@ if __name__ == "__main__":
   # merge_strategy = args.merge_strategy
   # nodes = args.nodes
   # networks = args.networks
-  base_folder = "../experiments/11n-8k/seed4850"
+  base_folder = "../experiments/9n-8k/seed4850"
   merge_strategy = "IMPROVED_OVERWRITE"
   nodes = "all"
   networks = [0]#"all"
@@ -444,6 +651,27 @@ if __name__ == "__main__":
         gossip_predictions, gossip_metrics = compute_predictions(
           g_models, g_X_Y_data, gplot_folders, tasks
         )
+        common_type_predictions, common_type_metrics = (
+            compute_common_test_predictions_by_node_type(
+                models=g_models,
+                all_X_Y_data=g_X_Y_data,
+                plot_folders=gplot_folders,
+                tasks=tasks,
+            )
+        )
+
+        if not common_type_metrics.empty:
+            common_type_metrics.to_csv(
+                os.path.join(
+                    base_folder,
+                    (
+                        f"{idx}_common_test_by_node_type_"
+                        f"{merge_strategy}.csv"
+                    ),
+                ),
+                index=False,
+            )
+
         for seed, plot_folder in gplot_folders.items():
           plot_predictions(
             gossip_predictions[gossip_predictions["seed"] == seed], 
@@ -456,6 +684,30 @@ if __name__ == "__main__":
             ["mse", "mape", "r2", "accuracy"], 
             plot_folder
           )
+          if not common_type_metrics.empty:
+              common_type_seed_metrics = (
+                  common_type_metrics[
+                      common_type_metrics["seed"] == seed
+                  ]
+              )
+
+              if not common_type_seed_metrics.empty:
+                  common_type_plot_folder = os.path.join(
+                      plot_folder,
+                      "common_test_by_node_type",
+                  )
+
+                  os.makedirs(
+                      common_type_plot_folder,
+                      exist_ok=True,
+                  )
+
+                  plot_metrics(
+                      common_type_seed_metrics,
+                      idx,
+                      ["mse", "mape", "r2", "accuracy"],
+                      common_type_plot_folder,
+                  )
         gossip_metrics.to_csv(
           os.path.join(
             base_folder, f"{idx}_gossip_metrics_{merge_strategy}.csv"
