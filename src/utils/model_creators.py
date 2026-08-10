@@ -109,6 +109,178 @@ class JanossyPooling(layers.Layer): # usato in train_model_cv e train_model (bui
     def compute_output_shape(self, input_shape):
         return (input_shape[0], input_shape[-1])
 
+@register_keras_serializable()
+class FedProxModel(keras.Model):
+    """
+    Keras model supporting an optional FedProx proximal term.
+
+    The reference weights are fixed before local training and remain
+    unchanged for all local epochs belonging to the same gossip update.
+    """
+
+    def __init__(
+        self,
+        *args,
+        use_fedprox: bool = False,
+        fedprox_mu: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        if fedprox_mu < 0:
+            raise ValueError(
+                "fedprox_mu must be greater than or equal to 0."
+            )
+
+        self.use_fedprox = bool(use_fedprox)
+        self.fedprox_mu = float(fedprox_mu)
+
+        # Transient reference weights.
+        # They are set by the gossip Node before local training.
+        self._fedprox_reference_weights = None
+
+    def set_fedprox_reference_weights(self) -> None:
+        """
+        Store a frozen copy of the current trainable variables.
+
+        This method must be called once after loading/merging the model
+        weights and before starting the local epochs.
+        """
+        if not self.use_fedprox:
+            self._fedprox_reference_weights = None
+            return
+
+        self._fedprox_reference_weights = [
+            tf.stop_gradient(tf.identity(variable))
+            for variable in self.trainable_variables
+        ]
+
+    def clear_fedprox_reference_weights(self) -> None:
+        """
+        Remove the reference weights after local training.
+        """
+        self._fedprox_reference_weights = None
+
+    def _compute_fedprox_penalty(self) -> tf.Tensor:
+        """
+        Compute:
+
+            mu / 2 * sum_j ||w_j - w_ref_j||^2
+        """
+        if (
+            not self.use_fedprox
+            or self.fedprox_mu == 0.0
+            or self._fedprox_reference_weights is None
+        ):
+            return tf.constant(0.0, dtype=tf.float32)
+
+        if len(self.trainable_variables) != len(
+            self._fedprox_reference_weights
+        ):
+            raise RuntimeError(
+                "The number of current trainable variables does not "
+                "match the number of FedProx reference variables."
+            )
+
+        squared_distances = [
+            tf.reduce_sum(
+                tf.square(
+                    current_variable
+                    - tf.cast(
+                        reference_variable,
+                        current_variable.dtype,
+                    )
+                )
+            )
+            for current_variable, reference_variable in zip(
+                self.trainable_variables,
+                self._fedprox_reference_weights,
+            )
+        ]
+
+        if not squared_distances:
+            return tf.constant(0.0, dtype=tf.float32)
+
+        total_squared_distance = tf.add_n(squared_distances)
+
+        return (
+            tf.cast(
+                self.fedprox_mu,
+                total_squared_distance.dtype,
+            )
+            * total_squared_distance
+            / 2.0
+        )
+
+    def train_step(self, data):
+        """
+        Perform one training step using the normal multitask loss
+        plus the optional FedProx proximal penalty.
+        """
+        x, y, sample_weight = keras.utils.unpack_x_y_sample_weight(data)
+
+        with tf.GradientTape() as tape:
+            y_pred = self(
+                x,
+                training=True,
+            )
+
+            # Computes the compiled multitask loss:
+            # 5.0 * masked_mse + 1.0 * binary_crossentropy
+            task_loss = self.compute_loss(
+                x=x,
+                y=y,
+                y_pred=y_pred,
+                sample_weight=sample_weight,
+                training=True,
+            )
+
+            fedprox_penalty = self._compute_fedprox_penalty()
+
+            total_loss = task_loss + fedprox_penalty
+
+        gradients = tape.gradient(
+            total_loss,
+            self.trainable_variables,
+        )
+
+        gradient_variable_pairs = [
+            (gradient, variable)
+            for gradient, variable in zip(
+                gradients,
+                self.trainable_variables,
+            )
+            if gradient is not None
+        ]
+
+        self.optimizer.apply_gradients(
+            gradient_variable_pairs
+        )
+
+        # Updates fn_0 metrics and fn_1 metrics separately.
+        results = self.compute_metrics(
+            x=x,
+            y=y,
+            y_pred=y_pred,
+            sample_weight=sample_weight,
+        )
+
+        results["fedprox_penalty"] = fedprox_penalty
+        results["total_loss_with_fedprox"] = total_loss
+
+        return results
+    
+    def get_config(self):
+        config = super().get_config()
+
+        config.update(
+            {
+                "use_fedprox": self.use_fedprox,
+                "fedprox_mu": self.fedprox_mu,
+            }
+        )
+
+        return config
 
 def build_janossy_rnn_model(config: Config): # usato in train_model_cv e train_model
     """
@@ -185,7 +357,20 @@ def build_janossy_rnn_model(config: Config): # usato in train_model_cv e train_m
     # -----------------------------
     # Build and compile model
     # -----------------------------
-    model = keras.Model(inputs=input_layer, outputs=[reg_output, cls_output], name="janossy_multitask_model")
+    if config.training.use_fedprox:
+        model = FedProxModel(
+            inputs=input_layer,
+            outputs=[reg_output, cls_output],
+            name="janossy_multitask_model",
+            use_fedprox=True,
+            fedprox_mu=config.training.fedprox_mu,
+        )
+    else:
+        model = keras.Model(
+            inputs=input_layer,
+            outputs=[reg_output, cls_output],
+            name="janossy_multitask_model",
+        )
 
     model.compile(
         optimizer='adam',

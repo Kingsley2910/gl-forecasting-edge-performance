@@ -117,6 +117,23 @@ class TrainingConfig(BaseModel):
         "performed each time a node triggers an "
         "update of the model",
     )
+
+    use_fedprox: bool = Field(
+        False,
+        description=(
+            "Whether to apply the FedProx proximal term "
+            "during gossip local training."
+        ),
+    )
+
+    fedprox_mu: float = Field(
+        0.0,
+        ge=0,
+        description=(
+            "Coefficient of the FedProx proximal term."
+        ),
+    )
+
     stop_criterion: StopCriterion = Field(
         ..., description="The stop criterion to be used"
     )

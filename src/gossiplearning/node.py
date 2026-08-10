@@ -549,6 +549,19 @@ class Node:
         model = self._create_model()
         model.set_weights(self._model.get_weights())
 
+        if self._training_config.use_fedprox:
+            if not hasattr(
+                model,
+                "set_fedprox_reference_weights",
+            ):
+                raise TypeError(
+                    "FedProx is enabled, but the created model "
+                    "does not support FedProx."
+                )
+
+            model.set_fedprox_reference_weights()
+
+
         X_train = self.data["X_train"]
         Y_train = self.data["Y_train"]
         if self._synthetic_data_by_node_type:
@@ -624,6 +637,13 @@ class Node:
 
         assert best_weights
         latest_weights = model.get_weights()
+
+        if hasattr(
+            model,
+            "clear_fedprox_reference_weights",
+        ):
+            model.clear_fedprox_reference_weights()
+            
         return latest_weights, best_weights, best_val_loss
 
     def marshal_model(self) -> WeightsMessage:
