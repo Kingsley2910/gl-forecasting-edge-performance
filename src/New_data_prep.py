@@ -21,7 +21,22 @@ from sklearn.model_selection import StratifiedShuffleSplit
 import gc
 from math import ceil
 
-node_types = ["LIGHT", "MID", "HEAVY"]
+# Folder names inside datasets
+node_types = [
+    "LIGHT",
+    "MID",
+    "HEAVY"
+]
+
+# Logical node types inside Gossip network
+network_node_types = [
+    "SOURCE_HEAVY",
+    "SOURCE_MID",
+    "SOURCE_LIGHT",
+    "TARGET_HEAVY",
+    "TARGET_MID",
+    "TARGET_LIGHT"
+]
 features = ['node_type',
  'rate_function_curl',
  'rate_function_eat_memory',
@@ -34,31 +49,63 @@ VERSION = 'V1'
 PATH_TO_AUGMENTED_ROWS = f"../data/augmented_rows/{VERSION}/" # usata in perform_custom_oversampling
 
 # Function to import data
-def import_data(path):
-  df = pd.DataFrame()
-  for node_type in node_types:
-      # Retrieve all files in the data folder
-      file_csv = [file for file in os.listdir(path + node_type) if file.endswith('.csv')]
-      # Create the dataframe by concatenating all read files
-      dataframes = []
-      for file in file_csv:
-          file_path = os.path.join(path + node_type, file)
-          df_temp = pd.read_csv(file_path)
-          # Remove the columns in the dataframe that begin with "function_"
-          df_temp.drop(columns=[col for col in df_temp if col.startswith('function_')], inplace=True)
-          # Add the column "node_type" and assign the value of 'type' to all rows
-          if node_type == "HEAVY":
-              df_temp["node_type"] = 0
-          elif node_type == "MID":
-              df_temp["node_type"] = 1
-          else:
-              df_temp["node_type"] = 2
+def import_data(path, domain):
+    df = pd.DataFrame()
 
-          dataframes.append(df_temp)
+    if domain == "source":
+        node_type_mapping = {
+            "HEAVY": 0,
+            "MID": 1,
+            "LIGHT": 2
+        }
 
-      df = pd.concat([df, *dataframes], axis=0, ignore_index=True)
+    elif domain == "target":
+        node_type_mapping = {
+            "HEAVY": 3,
+            "MID": 4,
+            "LIGHT": 5
+        }
 
-  return df
+    else:
+        raise ValueError(f"Unknown domain: {domain}")
+
+    for node_type in node_types:
+
+        # Retrieve all files in the data folder
+        file_csv = [
+            file
+            for file in os.listdir(path + node_type)
+            if file.endswith('.csv')
+        ]
+
+        dataframes = []
+
+        for file in file_csv:
+
+            file_path = os.path.join(path + node_type, file)
+            df_temp = pd.read_csv(file_path)
+
+            # Remove columns beginning with function_
+            df_temp.drop(
+                columns=[
+                    col for col in df_temp
+                    if col.startswith('function_')
+                ],
+                inplace=True
+            )
+
+            # Assign domain-specific node type
+            df_temp["node_type"] = node_type_mapping[node_type]
+
+            dataframes.append(df_temp)
+
+        df = pd.concat(
+            [df, *dataframes],
+            axis=0,
+            ignore_index=True
+        )
+
+    return df
 
 
 # Function used to fill NaN values within the dataframe X
@@ -117,14 +164,21 @@ def overload_status_ratio(df,features,target):
   return df
 
 def get_node_capacity(node_id: int) -> int:
-  # Lookup for node capacities
-  GB = 1024 ** 3  # 1 GB in bytes
-  capacities = {
-      0: 24 * GB,   # Heavy
-      1: 16 * GB,   # Mid
-      2:  8 * GB    # Light
-  }
-  return capacities[node_id]
+    GB = 1024 ** 3
+
+    capacities = {
+        # SOURCE DOMAIN
+        0: 24 * GB,   # HEAVY
+        1: 16 * GB,   # MID
+        2:  8 * GB,   # LIGHT
+
+        # TARGET DOMAIN
+        3: 24 * GB,   # HEAVY
+        4: 16 * GB,   # MID
+        5:  8 * GB    # LIGHT
+    }
+
+    return capacities[node_id]
 
 def ram_usage_to_percentage(ram_usage, node_type):
     """Return RAM utilization % given usage (bytes) and node type."""
@@ -183,8 +237,8 @@ def remove_outliers(df):
 # creation of function to perform all the processes ---------------------------------------
 
 # data preparation
-def prepare_single_dataset(path_to_csvs: str, features: list) -> pd.DataFrame:
-    df = import_data(path_to_csvs)
+def prepare_single_dataset(path_to_csvs: str, features: list, domain: str) -> pd.DataFrame:
+    df = import_data(path_to_csvs, domain)
     df = fill_NaN(df)
     df = assign_zero_to_noise(df)
     df = select_columns(df)
@@ -289,8 +343,8 @@ def prepare_source_target_datasets(path_source: str, path_target: str):
      'rate_function_nmap',
      'rate_function_shasum']
 
-    df_source = prepare_single_dataset(path_source, initial_features)
-    df_target = prepare_single_dataset(path_target, initial_features)
+    df_source = prepare_single_dataset(path_source, initial_features, domain="source")
+    df_target = prepare_single_dataset(path_target, initial_features, domain="target")
 
     features, numerical_features, tasks, tasks_unified = build_tasks_and_datasets(df_source)
 
@@ -375,16 +429,23 @@ def display_results(results_df):
 
 
 def convert_node_type(node_type: str) -> int:
-  node_type_idx = -1
-  if node_type == "HEAVY":
-    node_type_idx = 0
-  elif node_type == "MID":
-    node_type_idx = 1
-  elif node_type == "LIGHT":
-    node_type_idx = 2
-  else:
-    raise RuntimeError(f"Node type `{node_type}` does not exist")
-  return node_type_idx
+
+    mapping = {
+        "SOURCE_HEAVY": 0,
+        "SOURCE_MID": 1,
+        "SOURCE_LIGHT": 2,
+
+        "TARGET_HEAVY": 3,
+        "TARGET_MID": 4,
+        "TARGET_LIGHT": 5
+    }
+
+    if node_type not in mapping:
+        raise RuntimeError(
+            f"Node type `{node_type}` does not exist"
+        )
+
+    return mapping[node_type]
 
 def assign_node_type(
     towers: pd.DataFrame, node_types: list, rng: np.random.Generator
@@ -603,6 +664,9 @@ def prepare_network_and_nodes_dataset(# non usata (da deprecare)
         node_types=node_types
     )
 
+    print("\nNode types assigned to network:")
+    print(network["node_type"].value_counts().sort_index())
+    print("...done")
     # -------------------------
     # 4. Distribute data to nodes
     # -------------------------
@@ -1539,7 +1603,7 @@ def prepare_data(
     k,
     seed,
     simulation,
-    node_types,
+    network_node_types,
     split_seed
 ):
 
@@ -1561,10 +1625,29 @@ def prepare_data(
     # ===============================
     data = prepare_source_target_datasets(path_to_csvs, path_to_csvs_target)
 
-    multi_target_x = data["feature_dataset_source"]["Multi_Task"]
-    multi_target_y = data["target_dataset_source"]["Multi_Task"]
+    source_x = data["feature_dataset_source"]["Multi_Task"]
+    source_y = data["target_dataset_source"]["Multi_Task"]
+
+    target_x = data["feature_dataset_target"]["Multi_Task"]
+    target_y = data["target_dataset_target"]["Multi_Task"]
+
+    multi_target_x = pd.concat(
+        [source_x, target_x],
+        axis=0,
+        ignore_index=True
+    )
+
+    multi_target_y = pd.concat(
+        [source_y, target_y],
+        axis=0,
+        ignore_index=True
+    )
+
     tasks = data["tasks"]
     unified_tasks = data["tasks_unified"]
+
+    print("\nNode types after Source + Target merge:")
+    print(multi_target_x["node_type"].value_counts().sort_index())
 
     # ===============================
     # LOAD NETWORK
@@ -1579,7 +1662,7 @@ def prepare_data(
         seed,
         simulation,
         rng,
-        node_types
+        network_node_types
     )
     print("...done")
 

@@ -580,16 +580,16 @@ if __name__ == "__main__":
   # merge_strategy = args.merge_strategy
   # nodes = args.nodes
   # networks = args.networks
-  base_folder = "../experiments/9n-8k/seed4850"
-  merge_strategy = "IMPROVED_OVERWRITE"
+  base_folder = "../experiments/18n-17k/seed4850"
+  merge_strategy = "NODE_TYPE_MERGE"
   nodes = "all"
-  networks = [0]#"all"
+  networks = [0, 1, 2, 3, 4]#"all"
   recompute_all = True
   if not isinstance(nodes, list):
     if str(nodes) != "all":
       nodes = [nodes]
     else:
-      nodes = list(range(9)) + ["centralized"]
+      nodes = list(range(18)) + ["centralized"]
   if not isinstance(networks, list):
     if str(networks) != "all":
       networks = [networks]
@@ -636,6 +636,11 @@ if __name__ == "__main__":
       g_models, g_X_Y_data, gplot_folders = load_gossip_models_and_data(
         base_folder, idx, merge_strategy
       )
+
+      print("NETWORK:", idx)
+      print("MODELLI GOSSIP TROVATI:", g_models.keys())
+      print("SEED TROVATI:", gplot_folders.keys())
+
       # -- compute predictions and metrics
       if not recompute_all and os.path.exists(
           os.path.join(

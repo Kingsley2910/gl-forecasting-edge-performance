@@ -159,9 +159,9 @@ class Node:
 
         Padding steps remain filled with zeros.
         """
-        if new_node_type not in (0, 1, 2):
+        if new_node_type not in (0, 1, 2, 3, 4, 5):
             raise ValueError(
-                f"Invalid node_type {new_node_type}. Expected 0, 1 or 2."
+                f"Invalid node_type {new_node_type}. Expected a value from 0 to 5."
             )
 
         X_modified = X.copy()
@@ -210,7 +210,7 @@ class Node:
         """
         received_node_type = message.sender_node_type
 
-        if received_node_type not in (0, 1, 2):
+        if received_node_type not in (0, 1, 2, 3, 4, 5):
             raise ValueError(
                 f"Invalid sender node_type: {received_node_type}"
             )
@@ -367,7 +367,7 @@ class Node:
                     f"{data_file.name}"
                 ) from error
 
-            if node_type not in (0, 1, 2):
+            if node_type not in (0, 1, 2, 3, 4, 5):
                 raise RuntimeError(
                     f"Invalid synthetic node type "
                     f"{node_type} in {data_file}"
@@ -643,7 +643,7 @@ class Node:
             "clear_fedprox_reference_weights",
         ):
             model.clear_fedprox_reference_weights()
-            
+
         return latest_weights, best_weights, best_val_loss
 
     def marshal_model(self) -> WeightsMessage:
