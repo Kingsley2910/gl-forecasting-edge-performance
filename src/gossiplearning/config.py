@@ -1,5 +1,6 @@
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import (
     BaseModel,
@@ -108,6 +109,30 @@ class TrainingConfig(BaseModel):
             "data are not loaded."
         ),
     )
+
+    synthetic_window_size: int = Field(
+        1,
+        ge=1,
+        description="Maximum number of synthetic blocks retained per node type.",
+    )
+
+    synthetic_dataset_mode: Literal["concatenate", "aggregate"] = Field(
+        "concatenate",
+        description="How retained synthetic blocks are used for training.",
+    )
+
+    @model_validator(mode="after")
+    def validate_node_type_merge(self) -> "TrainingConfig":
+        if self.merge_strategy == MergeStrategy.NODE_TYPE_MERGE:
+            if self.num_merged_models != 1:
+                raise ValueError(
+                    "NODE_TYPE_MERGE requires num_merged_models=1."
+                )
+            if self.perc_sent_weights != 1:
+                raise ValueError(
+                    "NODE_TYPE_MERGE requires perc_sent_weights=1."
+                )
+        return self
   
     batch_size: int = Field(..., description="The batch size to be used for training")
     epochs_per_update: int = Field(
