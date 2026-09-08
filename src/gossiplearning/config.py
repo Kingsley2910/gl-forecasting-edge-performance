@@ -121,6 +121,14 @@ class TrainingConfig(BaseModel):
         description="How retained synthetic blocks are used for training.",
     )
 
+    node_type_model_update: Literal["overwrite", "keep_local"] = Field(
+        "overwrite",
+        description=(
+            "For NODE_TYPE_MERGE: start training from the received "
+            "model or keep the local model weights."
+        ),
+    )
+
     @model_validator(mode="after")
     def validate_node_type_merge(self) -> "TrainingConfig":
         if self.merge_strategy == MergeStrategy.NODE_TYPE_MERGE:

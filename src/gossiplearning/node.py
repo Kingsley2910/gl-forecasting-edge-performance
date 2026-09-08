@@ -516,11 +516,19 @@ class Node:
                 )
                 # -----------------------------
 
-        self._model, self.accumulated_weight = self._aggregator(
-            self._model,
-            self.accumulated_weight,
-            tuple(msg for k, msg in self._received_weights.items()),
+        keep_local = (
+            self._training_config.merge_strategy
+            == MergeStrategy.NODE_TYPE_MERGE
+            and self._training_config.node_type_model_update
+            == "keep_local"
         )
+
+        if not keep_local:
+            self._model, self.accumulated_weight = self._aggregator(
+                self._model,
+                self.accumulated_weight,
+                tuple(self._received_weights.values()),
+            )
 
         self._received_weights = {}
 

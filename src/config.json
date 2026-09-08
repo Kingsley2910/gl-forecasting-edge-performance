@@ -17,6 +17,7 @@
     "n_input_features": 12,
     "n_output_vars": 2,
     "merge_strategy": "node_type_merge",
+    "node_type_model_update": "keep_local",
     "synthetic_window_size": 5,
     "synthetic_dataset_mode": "aggregate",
     "stop_criterion": "fixed_updates",

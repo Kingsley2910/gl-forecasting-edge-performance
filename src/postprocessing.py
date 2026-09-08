@@ -150,6 +150,10 @@ def compute_common_test_predictions_by_node_type(
 
     all_predictions = pd.DataFrame()
 
+    regression_targets = list(
+        tasks["Multi_Task_regression"]["targets"]
+    )
+
     all_metrics = {
         "key": [],
         "node": [],
@@ -157,6 +161,9 @@ def compute_common_test_predictions_by_node_type(
         "seed": [],
         "metrics": [],
     }
+
+    for target in regression_targets:
+        all_metrics[f"mse_{target}"] = []
 
     for node, sim_models in models.items():
         for seed, model in sim_models.items():
@@ -231,7 +238,7 @@ def compute_common_test_predictions_by_node_type(
                 exist_ok=True,
             )
 
-            for common_test_node_type in (0, 1, 2):
+            for common_test_node_type in (0, 1, 2 , 3 ,4, 5):
 
                 type_mask = (
                     sample_node_types
@@ -303,6 +310,41 @@ def compute_common_test_predictions_by_node_type(
                     Y_type,
                     pred,
                 )
+
+                # Same regression columns and valid rows as compute_metrics().
+                reg_truth = np.asarray(Y_type[:, :-1])
+                reg_pred = np.asarray(pred[0])
+
+                if (
+                    reg_truth.shape != reg_pred.shape
+                    or reg_truth.shape[1] != len(regression_targets)
+                ):
+                    raise ValueError(
+                        "Regression shapes do not match the target names: "
+                        f"truth={reg_truth.shape}, "
+                        f"predictions={reg_pred.shape}, "
+                        f"targets={regression_targets}"
+                    )
+
+                valid_rows = ~np.all(
+                    np.isnan(reg_truth),
+                    axis=1,
+                )
+
+                squared_errors = (
+                    reg_truth[valid_rows] - reg_pred[valid_rows]
+                ) ** 2
+
+                # Average over samples, keeping one MSE per target.
+                mse_per_target = squared_errors.mean(axis=0)
+
+                for target, target_mse in zip(
+                    regression_targets,
+                    mse_per_target,
+                ):
+                    all_metrics[f"mse_{target}"].append(
+                        float(target_mse)
+                    )
 
                 all_metrics["key"].append(dataset_key)
                 all_metrics["node"].append(node)
