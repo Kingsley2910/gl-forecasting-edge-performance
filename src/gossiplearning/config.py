@@ -121,11 +121,23 @@ class TrainingConfig(BaseModel):
         description="How retained synthetic blocks are used for training.",
     )
 
-    node_type_model_update: Literal["overwrite", "keep_local"] = Field(
+    node_type_model_update: Literal[
+        "overwrite", "keep_local", "interpolate"
+    ] = Field(
         "overwrite",
         description=(
-            "For NODE_TYPE_MERGE: start training from the received "
-            "model or keep the local model weights."
+            "For NODE_TYPE_MERGE: overwrite, keep local parameters, "
+            "or interpolate between local and received parameters."
+        ),
+    )
+
+    node_type_alpha: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Received-model contribution when using interpolate. "
+            "0 keeps local parameters; 1 adopts received parameters."
         ),
     )
 

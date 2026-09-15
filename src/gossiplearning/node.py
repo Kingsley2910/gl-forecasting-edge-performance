@@ -516,18 +516,74 @@ class Node:
                 )
                 # -----------------------------
 
-        keep_local = (
+        messages = tuple(self._received_weights.values())
+
+        if (
             self._training_config.merge_strategy
             == MergeStrategy.NODE_TYPE_MERGE
-            and self._training_config.node_type_model_update
-            == "keep_local"
-        )
+        ):
+            mode = self._training_config.node_type_model_update
+            alpha = self._training_config.node_type_alpha
 
-        if not keep_local:
+            if mode == "keep_local":
+                # Keep local parameters and accumulated weight.
+                pass
+
+            elif mode == "overwrite" or (
+                mode == "interpolate" and alpha == 1.0
+            ):
+                # Preserve the existing overwrite behavior exactly.
+                self._model, self.accumulated_weight = self._aggregator(
+                    self._model,
+                    self.accumulated_weight,
+                    messages,
+                )
+
+            elif mode == "interpolate":
+                if len(messages) != 1:
+                    raise RuntimeError(
+                        "Interpolation requires exactly one received model."
+                    )
+
+                # alpha=0 preserves the existing keep_local behavior.
+                if alpha > 0.0:
+                    local_weights = self._model.get_weights()
+
+                    received_weights = unflatten_weights(
+                        self._model,
+                        messages[0].marshaled_weights.weights,
+                    )
+
+                    interpolated_weights = [
+                        (
+                            local + alpha * (received - local)
+                        ).astype(local.dtype, copy=False)
+                        for local, received in zip(
+                            local_weights,
+                            received_weights,
+                        )
+                    ]
+
+                    self._model.set_weights(interpolated_weights)
+
+                    # Bookkeeping convention for a mixed model:
+                    # retain the larger accumulated weight.
+                    self.accumulated_weight = max(
+                        self.accumulated_weight,
+                        messages[0].model_weight,
+                    )
+
+            else:
+                raise ValueError(
+                    f"Unknown node_type_model_update: {mode}"
+                )
+
+        else:
+            # Other merge strategies keep their existing behavior.
             self._model, self.accumulated_weight = self._aggregator(
                 self._model,
                 self.accumulated_weight,
-                tuple(self._received_weights.values()),
+                messages,
             )
 
         self._received_weights = {}
