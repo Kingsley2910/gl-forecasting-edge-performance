@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Optional
 from collections import deque
 
+import json
+import random
+
 from gossiplearning.config import TrainingConfig, HistoryConfig
 from gossiplearning.log import Logger
 from gossiplearning.models import (
@@ -466,6 +469,229 @@ class Node:
             f"from {node_dir}"
         )
 
+    def _diagnostics_enabled(self):
+        return (
+            self.id == 4
+            and self._training_config.merge_strategy
+            == MergeStrategy.NODE_TYPE_MERGE
+        )
+
+    def _diagnostics_dir(self):
+        folder = self._workspace_dir / "diagnostics" / f"node_{self.id}"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _diagnostics_evaluate(self, model, stage):
+        """Evaluate on fixed local inputs, without changing training data."""
+        if not self._diagnostics_enabled():
+            return
+
+        # Prepare fixed permutations only once.
+        # Restore Python/NumPy RNG states afterwards.
+        if not hasattr(self, "_diagnostics_inputs"):
+            python_state = random.getstate()
+            numpy_state = np.random.get_state()
+
+            try:
+                random.seed(12345)
+                np.random.seed(12345)
+
+                self._diagnostics_inputs = {
+                    split: prepare_janossy_test_input(
+                        self.data[f"X_{split}"],
+                        num_permutations=6,
+                    )
+                    for split in ("train", "val")
+                }
+            finally:
+                random.setstate(python_state)
+                np.random.set_state(numpy_state)
+
+        folder = self._diagnostics_dir()
+        update = self._completed_updates + 1
+
+        record = {
+            "update": update,
+            "plot_index": update - 1,
+            "stage": stage,
+        }
+        arrays = {}
+
+        for split, inputs in self._diagnostics_inputs.items():
+            truth = np.asarray(self.data[f"Y_{split}"])
+
+            regression_batches = []
+            probability_batches = []
+
+            # Direct inference, with dropout disabled.
+            # Batch to avoid evaluating the entire dataset at once.
+            batch_size = self._training_config.batch_size
+
+            for start in range(0, len(inputs), batch_size):
+                predictions = model(
+                    inputs[start:start + batch_size],
+                    training=False,
+                )
+                regression_batches.append(np.asarray(predictions[0]))
+                probability_batches.append(np.asarray(predictions[1]))
+
+            regression = np.concatenate(regression_batches, axis=0)
+            probabilities = np.concatenate(
+                probability_batches, axis=0
+            ).reshape(-1).astype(np.float64)
+
+            labels = truth[:, -1].astype(int)
+            predicted_labels = (probabilities > 0.5).astype(int)
+
+            if not np.isfinite(probabilities).all():
+                raise ValueError("Non-finite diagnostic probabilities")
+
+            # Diagnostic BCE computed directly from probabilities.
+            p = np.clip(probabilities, 1e-7, 1 - 1e-7)
+            sample_bce = -(
+                labels * np.log(p)
+                + (1 - labels) * np.log1p(-p)
+            )
+
+            valid_rows = ~np.all(
+                np.isnan(truth[:, :3]), axis=1
+            )
+
+            mse = None
+            if valid_rows.any():
+                mse = float(np.mean(
+                    (
+                        truth[valid_rows, :3]
+                        - regression[valid_rows]
+                    ) ** 2
+                ))
+
+            record[split] = {
+                "samples": len(labels),
+                "accuracy": float(np.mean(predicted_labels == labels)),
+                "bce": float(np.mean(sample_bce)),
+                "mse": mse,
+                "true_negative": int(np.sum(
+                    (labels == 0) & (predicted_labels == 0)
+                )),
+                "false_positive": int(np.sum(
+                    (labels == 0) & (predicted_labels == 1)
+                )),
+                "false_negative": int(np.sum(
+                    (labels == 1) & (predicted_labels == 0)
+                )),
+                "true_positive": int(np.sum(
+                    (labels == 1) & (predicted_labels == 1)
+                )),
+            }
+
+            # Row order matches the original local dataset.
+            arrays[f"{split}_truth"] = truth
+            arrays[f"{split}_probabilities"] = probabilities
+            arrays[f"{split}_sample_bce"] = sample_bce
+            arrays[f"{split}_regression"] = regression
+
+        prefix = folder / f"update_{update:03d}_{stage}"
+
+        prefix.with_suffix(".json").write_text(
+            json.dumps(record, indent=2)
+        )
+        np.savez_compressed(
+            prefix.with_suffix(".npz"),
+            **arrays,
+        )
+
+    def _diagnostics_synthetic_changes(self, previous, senders):
+        """Compare the old and new synthetic datasets used for training."""
+        if not self._diagnostics_enabled():
+            return
+
+        changes = []
+
+        for node_type, (_, new_y) in (
+            self._synthetic_data_by_node_type.items()
+        ):
+            old_y = previous.get(node_type)
+
+            item = {
+                "node_type": int(node_type),
+                "new_type": old_y is None,
+                "samples_after": len(new_y),
+                "overloaded_count_after": int(
+                    np.sum(new_y[:, -1] == 1)
+                ),
+                "overloaded_fraction_after": float(
+                    np.mean(new_y[:, -1])
+                ),
+                "retained_blocks": len(
+                    self._synthetic_history_by_node_type[node_type][1]
+                ),
+            }
+
+            if old_y is not None:
+                item["samples_before"] = len(old_y)
+                item["overloaded_fraction_before"] = float(
+                    np.mean(old_y[:, -1])
+                )
+
+                # Row-by-row comparison is valid for aggregate:
+                # same local workloads, same order, same remote type.
+                if (
+                    self._training_config.synthetic_dataset_mode
+                    == "aggregate"
+                    and old_y.shape == new_y.shape
+                ):
+                    old_labels = old_y[:, -1]
+                    new_labels = new_y[:, -1]
+
+                    item["changed_labels"] = int(np.sum(
+                        old_labels != new_labels
+                    ))
+                    item["changed_fraction"] = float(np.mean(
+                        old_labels != new_labels
+                    ))
+                    item["zero_to_one"] = int(np.sum(
+                        (old_labels == 0) & (new_labels == 1)
+                    ))
+                    item["one_to_zero"] = int(np.sum(
+                        (old_labels == 1) & (new_labels == 0)
+                    ))
+                    item["regression_mean_absolute_change"] = (
+                        np.mean(
+                            np.abs(new_y[:, :3] - old_y[:, :3]),
+                            axis=0,
+                        ).tolist()
+                    )
+
+            changes.append(item)
+
+        update = self._completed_updates + 1
+
+        record = {
+            "update": update,
+            "plot_index": update - 1,
+            "senders": senders,
+            "model_update_mode":
+                self._training_config.node_type_model_update,
+            "synthetic_mode":
+                self._training_config.synthetic_dataset_mode,
+            "local_samples": len(self.data["X_train"]),
+            "local_overloaded_count": int(
+                np.sum(self.data["Y_train"][:, -1] == 1)
+            ),
+            "synthetic_samples": sum(
+                len(y)
+                for _, y in self._synthetic_data_by_node_type.values()
+            ),
+            "changes": changes,
+        }
+
+        path = (
+            self._diagnostics_dir()
+            / f"update_{update:03d}_synthetic_changes.json"
+        )
+        path.write_text(json.dumps(record, indent=2))
+
     def merge_models(self) -> None:
         """
         Merge all the received model weights into the current model.
@@ -477,6 +703,30 @@ class Node:
         synthetic data representing its node type. Synthetic data for the
         same node type replace the previously stored block.
         """
+        diagnostics_previous = {}
+        diagnostics_senders = []
+
+        if self._diagnostics_enabled():
+            self._diagnostics_pending = True
+
+            diagnostics_previous = {
+                node_type: y.copy()
+                for node_type, (_, y)
+                in self._synthetic_data_by_node_type.items()
+            }
+
+            diagnostics_senders = [
+                {
+                    "node": int(sender),
+                    "node_type": int(message.sender_node_type),
+                }
+                for sender, message in self._received_weights.items()
+            ]
+
+            self._diagnostics_evaluate(
+                self._model,
+                "before_merge",
+            )
 
         messages = tuple(self._received_weights.values())
 
@@ -728,6 +978,16 @@ class Node:
             "clear_fedprox_reference_weights",
         ):
             model.clear_fedprox_reference_weights()
+
+        if (
+            self._diagnostics_enabled()
+            and getattr(self, "_diagnostics_pending", False)
+        ):
+            self._diagnostics_evaluate(
+                model,
+                "after_training",
+            )
+            self._diagnostics_pending = False
 
         return latest_weights, best_weights, best_val_loss
 
