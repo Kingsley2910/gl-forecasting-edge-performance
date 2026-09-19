@@ -836,6 +836,16 @@ class Node:
                 messages,
             )
 
+        if self._diagnostics_enabled():
+            self._diagnostics_synthetic_changes(
+                diagnostics_previous,
+                diagnostics_senders,
+            )
+            self._diagnostics_evaluate(
+                self._model,
+                "after_merge",
+            )
+
         self._received_weights = {}
 
 
