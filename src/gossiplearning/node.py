@@ -471,8 +471,7 @@ class Node:
 
     def _diagnostics_enabled(self):
         return (
-            self.id == 4
-            and self._training_config.merge_strategy
+            self._training_config.merge_strategy
             == MergeStrategy.NODE_TYPE_MERGE
         )
 

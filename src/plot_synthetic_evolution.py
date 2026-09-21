@@ -104,22 +104,17 @@ def plot_evolution(table, output):
 
         ax.plot(
             updates,
-            subset["non_overloaded_pct"],
-            label="Non overloaded (0)",
-            color="tab:blue",
-            drawstyle="steps-post",
-        )
-        ax.plot(
-            updates,
             subset["overloaded_pct"],
             label="Overloaded (1)",
             color="tab:orange",
             drawstyle="steps-post",
+            marker=".",
+            markersize=3,
         )
 
         ax.set_title(dataset)
         ax.set_xlabel("Gossip update (starting at 1)")
-        ax.set_ylabel("Samples (%)")
+        ax.set_ylabel("Overloaded (%)")
         ax.set_ylim(0, 100)
         ax.grid(alpha=0.25)
 
@@ -131,12 +126,12 @@ def plot_evolution(table, output):
         handles,
         labels,
         loc="upper center",
-        ncol=2,
+        ncol=1,
         bbox_to_anchor=(0.5, 1.0),
     )
 
     fig.suptitle(
-        "Class proportions in the dataset used for each update",
+        "Overloaded percentage in the dataset used for each update",
         y=1.025,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.96))
