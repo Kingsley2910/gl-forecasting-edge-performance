@@ -481,13 +481,17 @@ class Node:
         return folder
 
     def _diagnostics_evaluate(self, model, stage):
-        """Evaluate on fixed local inputs, without changing training data."""
+        """Light diagnostics on local validation only."""
         if not self._diagnostics_enabled():
             return
 
-        # Prepare fixed permutations only once.
-        # Restore Python/NumPy RNG states afterwards.
-        if not hasattr(self, "_diagnostics_inputs"):
+        if stage not in ("before_merge", "after_training"):
+            raise ValueError(
+                f"Unsupported diagnostic stage: {stage}"
+            )
+
+        # Prepare fixed validation inputs only once.
+        if not hasattr(self, "_diagnostics_val_inputs"):
             python_state = random.getstate()
             numpy_state = np.random.get_state()
 
@@ -495,110 +499,159 @@ class Node:
                 random.seed(12345)
                 np.random.seed(12345)
 
-                self._diagnostics_inputs = {
-                    split: prepare_janossy_test_input(
-                        self.data[f"X_{split}"],
+                self._diagnostics_val_inputs = (
+                    prepare_janossy_test_input(
+                        self.data["X_val"],
                         num_permutations=6,
                     )
-                    for split in ("train", "val")
-                }
+                )
             finally:
                 random.setstate(python_state)
                 np.random.set_state(numpy_state)
 
-        folder = self._diagnostics_dir()
+        inputs = self._diagnostics_val_inputs
+        labels = np.asarray(self.data["Y_val"])[:, -1]
+
+        if (
+            len(labels) == 0
+            or not np.isin(labels, [0, 1]).all()
+        ):
+            raise ValueError(
+                "Validation must contain binary labels."
+            )
+
+        counts = np.zeros(2, dtype=np.int64)
+        loss_sums = np.zeros(2, dtype=np.float64)
+        confusion = np.zeros((2, 2), dtype=np.int64)
+
+        batch_size = self._training_config.batch_size
+
+        for start in range(0, len(inputs), batch_size):
+            predictions = model(
+                inputs[start:start + batch_size],
+                training=False,
+            )
+
+            probabilities = (
+                np.asarray(predictions[1])
+                .reshape(-1)
+                .astype(np.float64)
+            )
+
+            truth = labels[
+                start:start + batch_size
+            ].astype(int)
+
+            if (
+                len(probabilities) != len(truth)
+                or not np.isfinite(probabilities).all()
+            ):
+                raise ValueError(
+                    "Invalid diagnostic probabilities."
+                )
+
+            predicted = (probabilities > 0.5).astype(int)
+
+            p = np.clip(
+                probabilities,
+                1e-7,
+                1 - 1e-7,
+            )
+
+            losses = -(
+                truth * np.log(p)
+                + (1 - truth) * np.log1p(-p)
+            )
+
+            np.add.at(
+                confusion,
+                (truth, predicted),
+                1,
+            )
+
+            for cls in (0, 1):
+                mask = truth == cls
+                counts[cls] += int(mask.sum())
+                loss_sums[cls] += losses[mask].sum()
+
+        metrics = {
+            "samples": len(labels),
+            "bce": float(
+                loss_sums.sum() / len(labels)
+            ),
+            "accuracy": float(
+                np.trace(confusion) / len(labels)
+            ),
+            "bce_class_0": (
+                float(loss_sums[0] / counts[0])
+                if counts[0] else None
+            ),
+            "bce_class_1": (
+                float(loss_sums[1] / counts[1])
+                if counts[1] else None
+            ),
+            "count_class_0": int(counts[0]),
+            "count_class_1": int(counts[1]),
+            "true_negative": int(confusion[0, 0]),
+            "false_positive": int(confusion[0, 1]),
+            "false_negative": int(confusion[1, 0]),
+            "true_positive": int(confusion[1, 1]),
+        }
+
         update = self._completed_updates + 1
 
-        record = {
-            "update": update,
-            "plot_index": update - 1,
-            "stage": stage,
-        }
-        arrays = {}
+        if stage == "before_merge":
+            self._diagnostics_before = (
+                update,
+                metrics,
+            )
+            return
 
-        for split, inputs in self._diagnostics_inputs.items():
-            truth = np.asarray(self.data[f"Y_{split}"])
+        before_update, before = (
+            self._diagnostics_before
+        )
+        record = self._diagnostics_synthetic_record
 
-            regression_batches = []
-            probability_batches = []
-
-            # Direct inference, with dropout disabled.
-            # Batch to avoid evaluating the entire dataset at once.
-            batch_size = self._training_config.batch_size
-
-            for start in range(0, len(inputs), batch_size):
-                predictions = model(
-                    inputs[start:start + batch_size],
-                    training=False,
-                )
-                regression_batches.append(np.asarray(predictions[0]))
-                probability_batches.append(np.asarray(predictions[1]))
-
-            regression = np.concatenate(regression_batches, axis=0)
-            probabilities = np.concatenate(
-                probability_batches, axis=0
-            ).reshape(-1).astype(np.float64)
-
-            labels = truth[:, -1].astype(int)
-            predicted_labels = (probabilities > 0.5).astype(int)
-
-            if not np.isfinite(probabilities).all():
-                raise ValueError("Non-finite diagnostic probabilities")
-
-            # Diagnostic BCE computed directly from probabilities.
-            p = np.clip(probabilities, 1e-7, 1 - 1e-7)
-            sample_bce = -(
-                labels * np.log(p)
-                + (1 - labels) * np.log1p(-p)
+        if (
+            before_update != update
+            or record["update"] != update
+        ):
+            raise RuntimeError(
+                "Diagnostic update numbers do not match."
             )
 
-            valid_rows = ~np.all(
-                np.isnan(truth[:, :3]), axis=1
+        record.update({
+            "format_version": 2,
+            "diagnostics_mode": "light",
+            "node_id": int(self.id),
+            "node_type": int(self.node_type),
+            "val_before_merge": before,
+            "val_after_training": metrics,
+
+            # Existing fit metrics: last epoch of this update.
+            "fit_last_epoch": {
+                key: float(values[-1])
+                for key, values
+                in self.training_history.items()
+                if len(values)
+            },
+            "fit_epoch_end": len(
+                self.training_history.get("loss", [])
+            ),
+        })
+
+        path = (
+            self._diagnostics_dir()
+            / "updates.jsonl"
+        )
+
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(record) + "\n"
             )
 
-            mse = None
-            if valid_rows.any():
-                mse = float(np.mean(
-                    (
-                        truth[valid_rows, :3]
-                        - regression[valid_rows]
-                    ) ** 2
-                ))
-
-            record[split] = {
-                "samples": len(labels),
-                "accuracy": float(np.mean(predicted_labels == labels)),
-                "bce": float(np.mean(sample_bce)),
-                "mse": mse,
-                "true_negative": int(np.sum(
-                    (labels == 0) & (predicted_labels == 0)
-                )),
-                "false_positive": int(np.sum(
-                    (labels == 0) & (predicted_labels == 1)
-                )),
-                "false_negative": int(np.sum(
-                    (labels == 1) & (predicted_labels == 0)
-                )),
-                "true_positive": int(np.sum(
-                    (labels == 1) & (predicted_labels == 1)
-                )),
-            }
-
-            # Row order matches the original local dataset.
-            arrays[f"{split}_truth"] = truth
-            arrays[f"{split}_probabilities"] = probabilities
-            arrays[f"{split}_sample_bce"] = sample_bce
-            arrays[f"{split}_regression"] = regression
-
-        prefix = folder / f"update_{update:03d}_{stage}"
-
-        prefix.with_suffix(".json").write_text(
-            json.dumps(record, indent=2)
-        )
-        np.savez_compressed(
-            prefix.with_suffix(".npz"),
-            **arrays,
-        )
+        del self._diagnostics_before
+        del self._diagnostics_synthetic_record
 
     def _diagnostics_synthetic_changes(self, previous, senders):
         """Compare the old and new synthetic datasets used for training."""
@@ -685,11 +738,7 @@ class Node:
             "changes": changes,
         }
 
-        path = (
-            self._diagnostics_dir()
-            / f"update_{update:03d}_synthetic_changes.json"
-        )
-        path.write_text(json.dumps(record, indent=2))
+        self._diagnostics_synthetic_record = record
 
     def merge_models(self) -> None:
         """
@@ -839,10 +888,6 @@ class Node:
             self._diagnostics_synthetic_changes(
                 diagnostics_previous,
                 diagnostics_senders,
-            )
-            self._diagnostics_evaluate(
-                self._model,
-                "after_merge",
             )
 
         self._received_weights = {}

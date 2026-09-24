@@ -47,18 +47,89 @@ def node_table(folder, records, node, node_type):
     for s in records:
         u = s['update']
         prefix = folder / f'update_{u:03d}'
-        paths = {stage: Path(f'{prefix}_{stage}.json')
-                 for stage in ('before_merge', 'after_merge', 'after_training')}
-        npz_path = Path(f'{prefix}_after_training.npz')
-        if not all(p.exists() for p in paths.values()) or not npz_path.exists():
-            raise FileNotFoundError(f'Node {node}, update {u}: incomplete diagnostics; wait for training to finish')
-        metrics = {stage: read_json(p) for stage, p in paths.items()}
-        b, m, a = [metrics[stage]['val'] for stage in paths]
-        with np.load(npz_path) as z:
-            labels = z['val_truth'][:, -1]
-            losses = z['val_sample_bce']
-            per_class = {c: float(losses[labels == c].mean())
-                         if np.any(labels == c) else np.nan for c in (0, 1)}
+        if s.get("diagnostics_mode") == "light":
+            b = s["val_before_merge"]
+            a = s["val_after_training"]
+
+            # This stage is not evaluated in light mode.
+            m = {"bce": np.nan}
+
+            per_class = {
+                c: (
+                    a[f"bce_class_{c}"]
+                    if a[f"bce_class_{c}"] is not None
+                    else np.nan
+                )
+                for c in (0, 1)
+            }
+
+            class_counts = {
+                c: a[f"count_class_{c}"]
+                for c in (0, 1)
+            }
+
+        else:
+            # Compatibility with old diagnostics.
+            stages = (
+                "before_merge",
+                "after_merge",
+                "after_training",
+            )
+
+            paths = {
+                stage: Path(
+                    f"{prefix}_{stage}.json"
+                )
+                for stage in stages
+            }
+
+            npz_path = Path(
+                f"{prefix}_after_training.npz"
+            )
+
+            if (
+                not all(
+                    path.exists()
+                    for path in paths.values()
+                )
+                or not npz_path.exists()
+            ):
+                raise FileNotFoundError(
+                    f"Node {node}, update {u}: "
+                    "incomplete diagnostics"
+                )
+
+            metrics = {
+                stage: read_json(path)
+                for stage, path in paths.items()
+            }
+
+            b, m, a = [
+                metrics[stage]["val"]
+                for stage in stages
+            ]
+
+            with np.load(npz_path) as z:
+                labels = z["val_truth"][:, -1]
+                losses = z["val_sample_bce"]
+
+                per_class = {
+                    c: (
+                        float(
+                            losses[labels == c].mean()
+                        )
+                        if np.any(labels == c)
+                        else np.nan
+                    )
+                    for c in (0, 1)
+                }
+
+                class_counts = {
+                    c: int(
+                        np.sum(labels == c)
+                    )
+                    for c in (0, 1)
+                }
         total = s['local_samples'] + s['synthetic_samples']
         overloaded = s['local_overloaded_count'] + sum(c['overloaded_count_after'] for c in s['changes'])
         row = {
@@ -70,10 +141,11 @@ def node_table(folder, records, node, node_type):
             'val_bce_before': b['bce'], 'val_bce_after_merge': m['bce'],
             'val_bce_after': a['bce'], 'delta_val_bce': a['bce'] - b['bce'],
             'val_accuracy_before': b['accuracy'], 'val_accuracy_after': a['accuracy'],
-            'val_mse_before': b['mse'], 'val_mse_after': a['mse'],
+            'val_mse_before': b.get('mse'),
+            'val_mse_after': a.get('mse'),
             'val_bce_class_0': per_class[0], 'val_bce_class_1': per_class[1],
-            'val_count_class_0': int(np.sum(labels == 0)),
-            'val_count_class_1': int(np.sum(labels == 1)),
+            'val_count_class_0': class_counts[0],
+            'val_count_class_1': class_counts[1],
             'changed_labels': sum(c.get('changed_labels', 0) for c in s['changes'])
                               if s['synthetic_mode'] == 'aggregate' else np.nan,
             'new_types': ';'.join(str(c['node_type']) for c in s['changes'] if c['new_type']),
@@ -83,6 +155,16 @@ def node_table(folder, records, node, node_type):
             'overloaded_pct': 100 * overloaded / total if total else np.nan,
             'non_overloaded_pct': 100 * (total-overloaded) / total if total else np.nan,
         }
+        row.update({
+            f"fit_{key}": value
+            for key, value
+            in s.get("fit_last_epoch", {}).items()
+        })
+
+        row["fit_epoch_end"] = s.get(
+            "fit_epoch_end"
+        )
+
         rows.append(row)
         for sender in s['senders']:
             exchanges.append({'receiver_node': node, 'receiver_type': node_type,
@@ -94,7 +176,7 @@ def node_table(folder, records, node, node_type):
 def plot_summary(table, folder, node, node_type, window, threshold):
     x = table['update']
     fig, ax = plt.subplots(4, 1, figsize=(14, 12), sharex=True, layout='constrained')
-    ax[0].plot(x, table.val_bce_before, label='Prima del training', marker='.', color='steelblue')
+    ax[0].plot(x, table.val_bce_before, label='Prima del merge', marker='.', color='steelblue')
     ax[0].plot(x, table.val_bce_after, label='Dopo il training', marker='.', color='firebrick')
     ax[0].set_ylabel('BCE validation locale'); ax[0].legend()
     for c, color in [(0, 'steelblue'), (1, 'darkorange')]:
@@ -141,7 +223,21 @@ def main():
     all_exchanges, missing = [], []
     for meta in types.itertuples(index=False):
         folder = root / f'node_{meta.node_id}'
-        if not list(folder.glob('update_*_synthetic_changes.json')):
+        has_diagnostics = (
+            (folder / "updates.jsonl").is_file()
+            or any(
+                folder.glob(
+                    "update_*_synthetic_changes.json"
+                )
+            )
+            or any(
+                folder.glob(
+                    "update_*_summary.json"
+                )
+            )
+        )
+
+        if not has_diagnostics:
             missing.append(meta.node_id)
             continue
         records = load_records(folder)

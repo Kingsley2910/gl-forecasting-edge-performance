@@ -10,15 +10,81 @@ import pandas as pd
 
 
 def load_records(folder):
-    files = sorted(folder.glob("update_*_synthetic_changes.json"))
+    jsonl_path = folder / "updates.jsonl"
 
-    if not files:
-        raise FileNotFoundError(
-            f"No diagnostic files found in {folder}"
+    old_files = sorted(
+        folder.glob("update_*_synthetic_changes.json")
+    )
+    light_files = sorted(
+        folder.glob("update_*_summary.json")
+    )
+
+    formats_found = (
+        int(jsonl_path.exists())
+        + int(bool(old_files))
+        + int(bool(light_files))
+    )
+
+    if formats_found > 1:
+        raise ValueError(
+            f"Mixed diagnostic formats in {folder}. "
+            "Use a separate folder for each simulation."
         )
 
-    records = [json.loads(path.read_text()) for path in files]
-    return sorted(records, key=lambda record: record["update"])
+    if jsonl_path.exists():
+        records = []
+
+        with jsonl_path.open(
+            "r",
+            encoding="utf-8",
+        ) as stream:
+            for line_number, line in enumerate(
+                stream,
+                start=1,
+            ):
+                if not line.strip():
+                    continue
+
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid JSON in {jsonl_path}, "
+                        f"line {line_number}. "
+                        "The run may still be writing "
+                        "or may have been interrupted."
+                    ) from exc
+    else:
+        files = light_files or old_files
+
+        records = [
+            json.loads(
+                path.read_text(encoding="utf-8")
+            )
+            for path in files
+        ]
+
+    if not records:
+        raise FileNotFoundError(
+            f"No diagnostic records found in {folder}"
+        )
+
+    updates = [
+        record["update"]
+        for record in records
+    ]
+
+    if len(updates) != len(set(updates)):
+        raise ValueError(
+            f"Duplicate updates in {folder}. "
+            "Do not save different runs "
+            "in the same diagnostics folder."
+        )
+
+    return sorted(
+        records,
+        key=lambda record: record["update"],
+    )
 
 
 def build_table(records):
